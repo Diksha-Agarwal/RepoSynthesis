@@ -4,7 +4,7 @@ from uuid import uuid4
 
 from sqlalchemy.exc import IntegrityError
 
-from db import AnalysisRun, Project, SessionLocal, utc_now
+from db import AnalysisResultRecord, AnalysisRun, Project, SessionLocal, utc_now
 
 
 ACTIVE_STATUSES = ("queued", "running")
@@ -158,6 +158,103 @@ def get_latest_run(project_id: int, run_type: str) -> Optional[Dict[str, Any]]:
             .first()
         )
         return run_to_dict(run) if run else None
+
+
+def finalize_analysis_run(
+    project_id: int,
+    run_id: str,
+    payload: Dict[str, Any],
+    *,
+    success: bool,
+    error_message: Optional[str] = None,
+) -> None:
+    with SessionLocal() as db:
+        run = (
+            db.query(AnalysisRun)
+            .filter(
+                AnalysisRun.id == run_id,
+                AnalysisRun.project_id == project_id,
+                AnalysisRun.run_type == "analysis",
+            )
+            .first()
+        )
+        if run is None:
+            raise ValueError("Analysis run not found for this project")
+
+        record = db.get(AnalysisResultRecord, run_id)
+        now = utc_now()
+        if record is None:
+            record = AnalysisResultRecord(
+                analysis_run_id=run_id,
+                project_id=project_id,
+                payload=payload,
+                created_at=now,
+                updated_at=now,
+            )
+            db.add(record)
+        else:
+            record.payload = payload
+            record.updated_at = now
+
+        run.status = "completed" if success else "failed"
+        if success:
+            run.progress = 100
+            run.current_activity = "Analysis complete"
+            run.error_message = None
+            log_message = "[100%] Analysis complete"
+        else:
+            run.current_activity = "Analysis failed"
+            run.error_message = error_message or "Unknown agent error"
+            log_message = f"Analysis failed: {run.error_message}"
+        run.completed_at = now
+        run.updated_at = now
+        run.logs = list(run.logs or []) + [log_message]
+        db.commit()
+
+
+def get_analysis_result(project_id: int, run_id: str) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        record = (
+            db.query(AnalysisResultRecord)
+            .filter(
+                AnalysisResultRecord.analysis_run_id == run_id,
+                AnalysisResultRecord.project_id == project_id,
+            )
+            .first()
+        )
+        return dict(record.payload) if record else None
+
+
+def get_latest_completed_analysis_result(project_id: int) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        record = (
+            db.query(AnalysisResultRecord)
+            .join(AnalysisRun, AnalysisRun.id == AnalysisResultRecord.analysis_run_id)
+            .filter(
+                AnalysisResultRecord.project_id == project_id,
+                AnalysisRun.run_type == "analysis",
+                AnalysisRun.status == "completed",
+            )
+            .order_by(AnalysisRun.completed_at.desc(), AnalysisResultRecord.created_at.desc())
+            .first()
+        )
+        return dict(record.payload) if record else None
+
+
+def list_completed_analysis_results(project_id: int) -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        records = (
+            db.query(AnalysisResultRecord)
+            .join(AnalysisRun, AnalysisRun.id == AnalysisResultRecord.analysis_run_id)
+            .filter(
+                AnalysisResultRecord.project_id == project_id,
+                AnalysisRun.run_type == "analysis",
+                AnalysisRun.status == "completed",
+            )
+            .order_by(AnalysisRun.completed_at.desc(), AnalysisResultRecord.created_at.desc())
+            .all()
+        )
+        return [dict(record.payload) for record in records]
 
 
 def cancel_orphaned_active_runs() -> int:

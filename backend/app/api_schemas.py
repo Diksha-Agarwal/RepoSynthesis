@@ -105,10 +105,6 @@ class LatestRunsResponse(BaseModel):
     analysis: Optional[RunResponse] = None
 
 
-class AnalysisResultResponse(BaseModel):
-    result: dict[str, Any]
-
-
 class ChatRequest(BaseModel):
     question: str = Field(min_length=1, max_length=10_000)
 

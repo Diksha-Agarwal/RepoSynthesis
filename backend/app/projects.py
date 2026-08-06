@@ -51,7 +51,10 @@ def _project_response(project: Project) -> ProjectResponse:
         name=project.name,
         github_url=project.github_url,
         uploaded_filename=Path(project.zip_filename).name if project.zip_filename else None,
-        has_analysis=(PROJECTS_DIR / str(project.id) / "analysis_result.json").exists(),
+        has_analysis=any(
+            run.status == "completed" and run.result_record is not None
+            for run in project.analysis_runs
+        ),
     )
 
 

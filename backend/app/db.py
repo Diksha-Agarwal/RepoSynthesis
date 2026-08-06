@@ -97,6 +97,31 @@ class AnalysisRun(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
 
     project = relationship("Project", back_populates="analysis_runs")
+    result_record = relationship(
+        "AnalysisResultRecord",
+        back_populates="analysis_run",
+        cascade="all, delete-orphan",
+        uselist=False,
+    )
+
+
+class AnalysisResultRecord(Base):
+    """Database envelope for one canonical analysis result payload."""
+
+    __tablename__ = "analysis_results"
+    __table_args__ = (Index("ix_analysis_results_project_created", "project_id", "created_at"),)
+
+    analysis_run_id = Column(
+        String(36),
+        ForeignKey("analysis_runs.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id = Column(Integer, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    payload = Column(JSON, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at = Column(DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now)
+
+    analysis_run = relationship("AnalysisRun", back_populates="result_record")
 
 
 Base.metadata.create_all(bind=engine)

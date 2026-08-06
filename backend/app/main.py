@@ -1,5 +1,4 @@
 import asyncio
-import json
 import sys
 import time
 import traceback
@@ -27,7 +26,6 @@ sys.path.insert(0, str(ROOT.parent))
 from api_schemas import (
     ActionResponse,
     AnalysisRequest,
-    AnalysisResultResponse,
     ChatRequest,
     ChatResponse,
     LatestRunsResponse,
@@ -36,6 +34,7 @@ from api_schemas import (
     RunResponse,
     RunStartResponse,
 )
+from app.models.schemas import AnalysisResult, AnalysisResultListResponse
 from db import Project
 from ingestion import IngestionError, SETTINGS, resolve_uploaded_zip
 from projects import get_project_or_404, router as projects_router
@@ -44,8 +43,12 @@ from run_store import (
     ProjectNotFoundError,
     cancel_orphaned_active_runs,
     create_run,
+    finalize_analysis_run,
+    get_analysis_result,
+    get_latest_completed_analysis_result,
     get_latest_run,
     get_run,
+    list_completed_analysis_results,
     list_project_runs,
     update_run,
 )
@@ -272,40 +275,27 @@ async def run_graphflow_analysis(
             ),
         )
         update("Creating analysis coordinator...", 5)
-        coordinator = GraphFlowCoordinator(project_id, config, project_dir=BASE_DATA_DIR / project_id)
+        coordinator = GraphFlowCoordinator(
+            project_id,
+            config,
+            project_dir=BASE_DATA_DIR / project_id,
+            analysis_run_id=run_id,
+        )
         coordinator.selected_personas = personas_list
         coordinator.status_callback = update
 
         update("Running agent pipeline...", 10)
         result = await coordinator.run_analysis()
-        if not result.success:
-            error_message = "; ".join(result.errors) if result.errors else "Unknown agent error"
-            update_run(
-                run_id,
-                status="failed",
-                current_activity="Analysis failed",
-                error_message=error_message,
-                log_message=f"Analysis failed: {error_message}",
-            )
-            return
-
-        result_data = {
-            "config": {"personas": personas, "depth": depth, "verbosity": verbosity},
-            "sde_report": result.sde_report.model_dump() if result.sde_report and "SDE" in personas_list else None,
-            "pm_report": result.pm_report.model_dump() if result.pm_report and "PM" in personas_list else None,
-            "time": result.execution_time_seconds,
-        }
-        project_dir = BASE_DATA_DIR / project_id
-        project_dir.mkdir(parents=True, exist_ok=True)
-        with (project_dir / "analysis_result.json").open("w", encoding="utf-8") as result_file:
-            json.dump(result_data, result_file, indent=2)
-        update_run(
+        error_message = "; ".join(result.errors) if result.errors else None
+        finalize_analysis_run(
+            int(project_id),
             run_id,
-            status="completed",
-            progress=100,
-            current_activity="Analysis complete",
-            log_message="[100%] Analysis complete",
+            result.model_dump(mode="json"),
+            success=result.success,
+            error_message=error_message,
         )
+        if not result.success:
+            return
     except Exception as exc:
         traceback.print_exc()
         error_message = f"{type(exc).__name__}: {exc}"
@@ -388,16 +378,59 @@ async def get_project_run(run_id: UUID, project: Project = Depends(get_project_o
     return RunResponse(**run)
 
 
-@app.get("/projects/{project_id}/result", response_model=AnalysisResultResponse)
+@app.get("/projects/{project_id}/result", response_model=AnalysisResult)
 async def get_result(project: Project = Depends(get_project_or_404)):
-    result_file = BASE_DATA_DIR / str(project.id) / "analysis_result.json"
-    if not result_file.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Analysis result not found")
-    try:
-        with result_file.open("r", encoding="utf-8") as source:
-            return AnalysisResultResponse(result=json.load(source))
-    except (OSError, json.JSONDecodeError):
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Stored analysis result could not be read")
+    result = get_latest_completed_analysis_result(project.id)
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "result_not_found", "message": "No completed analysis result exists for this project"},
+        )
+    return AnalysisResult(**result)
+
+
+@app.get("/projects/{project_id}/results", response_model=AnalysisResultListResponse)
+async def get_project_results(project: Project = Depends(get_project_or_404)):
+    results = [AnalysisResult(**result) for result in list_completed_analysis_results(project.id)]
+    return AnalysisResultListResponse(results=results)
+
+
+@app.get("/projects/{project_id}/results/{analysis_run_id}", response_model=AnalysisResult)
+async def get_result_by_run(analysis_run_id: UUID, project: Project = Depends(get_project_or_404)):
+    run = get_run(project.id, str(analysis_run_id))
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "run_not_found", "message": "Analysis run not found for this project"},
+        )
+    if run["run_type"] != "analysis":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"code": "invalid_run_type", "message": "The requested run is not an analysis run"},
+        )
+    if run["status"] == "failed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "analysis_run_failed",
+                "message": run["error_message"] or "Analysis run failed",
+            },
+        )
+    if run["status"] != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "analysis_run_incomplete",
+                "message": f"Analysis run is {run['status']} and has no completed result",
+            },
+        )
+    result = get_analysis_result(project.id, str(analysis_run_id))
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "result_not_found", "message": "Completed analysis result is unavailable"},
+        )
+    return AnalysisResult(**result)
 
 
 @app.post("/projects/{project_id}/ask", response_model=ChatResponse)
@@ -427,27 +460,21 @@ async def ask(payload: ChatRequest, project: Project = Depends(get_project_or_40
         )
         analysis_context = ""
         using_partial = False
-        analysis_file = project_dir / "analysis_result.json"
-        if analysis_file.exists():
-            try:
-                with analysis_file.open("r", encoding="utf-8") as source:
-                    analysis_data = json.load(source)
-                sde_report = analysis_data.get("sde_report") or {}
-                if sde_report:
-                    component_names = ", ".join(item.get("name", "") for item in sde_report.get("components", [])[:5])
-                    api_names = ", ".join(
-                        "{} {}".format(item.get("method", ""), item.get("endpoint", ""))
-                        for item in sde_report.get("apis", [])[:5]
-                    )
-                    analysis_context = (
-                        "Analysis Summary:\n"
-                        f"Architecture: {sde_report.get('architecture_summary', '')[:300]}\n\n"
-                        f"Components: {component_names}\n\n"
-                        f"APIs: {api_names}\n\n"
-                        f"Database: {str(sde_report.get('database_model', ''))[:200]}"
-                    )
-            except (OSError, json.JSONDecodeError):
-                pass
+        analysis_data = get_latest_completed_analysis_result(project.id)
+        sde_report = (analysis_data or {}).get("sde_report") or {}
+        if sde_report:
+            component_names = ", ".join(item.get("name", "") for item in sde_report.get("components", [])[:5])
+            api_names = ", ".join(
+                "{} {}".format(item.get("method", ""), item.get("endpoint", ""))
+                for item in sde_report.get("apis", [])[:5]
+            )
+            analysis_context = (
+                "Analysis Summary:\n"
+                f"Architecture: {sde_report.get('architecture_summary', '')[:300]}\n\n"
+                f"Components: {component_names}\n\n"
+                f"APIs: {api_names}\n\n"
+                f"Database: {str(sde_report.get('database_model', ''))[:200]}"
+            )
         latest_analysis_run = get_latest_run(project.id, "analysis")
         if not analysis_context and latest_analysis_run and latest_analysis_run["status"] == "running":
             insights = latest_analysis_run.get("agent_insights", {})

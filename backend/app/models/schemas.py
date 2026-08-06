@@ -4,6 +4,9 @@ Defines flexible JSON structures for each AutoGen agent's output
 Designed to handle variable LLM responses gracefully
 """
 
+from datetime import datetime, timezone
+from uuid import UUID
+
 from pydantic import BaseModel, Field, field_validator
 from typing import List, Optional, Dict, Any, Union
 
@@ -230,19 +233,23 @@ class QAOutput(BaseModel):
 # ============================================================================
 
 class AnalysisResult(BaseModel):
-    """Final combined analysis result from all agents"""
-    project_id: str = Field(description="Project UUID")
-    config_used: Dict[str, Any] = Field(description="Analysis configuration used")
+    """Canonical analysis result returned by GraphFlow and the public API."""
+
+    project_id: str = Field(description="Project identifier")
+    analysis_run_id: UUID = Field(description="Persistent analysis run UUID")
+    analysis_configuration: Dict[str, Any] = Field(description="Analysis configuration used")
     coordinator_output: Optional[CoordinatorOutput] = Field(default=None, description="Coordinator analysis")
     semantic_analysis: Optional[SemanticQueryOutput] = Field(default=None)
-    best_practices: Optional[BestPracticeOutput] = Field(default=None)
+    best_practice_findings: Optional[BestPracticeOutput] = Field(default=None)
     sde_report: Optional[SDEOutput] = Field(default=None)
     pm_report: Optional[PMOutput] = Field(default=None)
     qa_report: Optional[QAOutput] = Field(default=None, description="Quality assurance validation")
-    agent_results: Dict[str, Any] = Field(
-        default_factory=dict,
-        description="Raw results from each agent"
-    )
     execution_time_seconds: float = Field(description="Total execution time")
     success: bool = Field(description="Whether analysis completed successfully")
     errors: List[str] = Field(default_factory=list, description="Any errors encountered")
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class AnalysisResultListResponse(BaseModel):
+    results: List[AnalysisResult] = Field(default_factory=list)

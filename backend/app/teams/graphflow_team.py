@@ -7,9 +7,11 @@ from autogen_agentchat.teams import DiGraphBuilder, GraphFlow
 from autogen_agentchat.messages import TextMessage
 from autogen_core import CancellationToken
 from typing import Dict, Any, Optional, List
+from datetime import datetime, timezone
 import json
 import time
 from pathlib import Path
+from uuid import uuid4
 
 from app.agents.coordinator_agent import create_coordinator_agent
 from app.agents.semantic_agent import create_semantic_query_agent
@@ -32,7 +34,13 @@ from app.config.analysis_config import AnalysisConfig, load_config
 
 class GraphFlowCoordinator:
     
-    def __init__(self, project_id: str, config: Optional[AnalysisConfig] = None, project_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        project_id: str,
+        config: Optional[AnalysisConfig] = None,
+        project_dir: Optional[Path] = None,
+        analysis_run_id: Optional[str] = None,
+    ):
         """
         Initialize the coordinator.
         
@@ -42,6 +50,7 @@ class GraphFlowCoordinator:
             project_dir: Optional absolute path to project directory (for deployment flexibility)
         """
         self.project_id = project_id
+        self.analysis_run_id = analysis_run_id or str(uuid4())
         # Use provided path or default relative path
         self.project_dir = project_dir if project_dir else Path(f"data/projects/{project_id}")
         
@@ -205,6 +214,13 @@ Coordinate a comprehensive codebase analysis through the pipeline."""
             AnalysisResult with all agent outputs
         """
         start_time = time.time()
+        result_created_at = datetime.now(timezone.utc)
+        coordinator_output = None
+        semantic_output = None
+        best_practice_output = None
+        sde_output = None
+        pm_output = None
+        qa_output = None
         
         print(f"🚀 Starting GraphFlow analysis for project {self.project_id}")
         print(f"   Config: {self.config.depth} depth, {self.config.verbosity} verbosity")
@@ -253,13 +269,6 @@ Coordinate a comprehensive codebase analysis through the pipeline."""
                         last_source = current_source
             
             # Extract outputs from messages
-            coordinator_output = None
-            semantic_output = None
-            best_practice_output = None
-            sde_output = None
-            pm_output = None
-            qa_output = None
-            
             for msg in result_messages:
                 content = msg.content if hasattr(msg, 'content') else str(msg)
                 source = msg.source if hasattr(msg, 'source') else 'unknown'
@@ -314,21 +323,23 @@ Coordinate a comprehensive codebase analysis through the pipeline."""
             # Build final result
             result = AnalysisResult(
                 project_id=self.project_id,
-                config_used=self.config.model_dump(),
+                analysis_run_id=self.analysis_run_id,
+                analysis_configuration={
+                    **self.config.model_dump(),
+                    "personas": self.selected_personas,
+                },
                 coordinator_output=coordinator_output,
                 semantic_analysis=semantic_output,
-                best_practices=best_practice_output,
+                best_practice_findings=best_practice_output,
                 sde_report=sde_output,
                 pm_report=pm_output,
                 qa_report=qa_output,
-                agent_results=self.results,
                 execution_time_seconds=round(execution_time, 2),
                 success=len(self.errors) == 0,
-                errors=self.errors
+                errors=self.errors,
+                created_at=result_created_at,
+                updated_at=datetime.now(timezone.utc),
             )
-            
-            # Save result
-            self._save_result(result)
             
             print(f"\n✅ GraphFlow analysis complete in {execution_time:.2f}s")
             if self.errors:
@@ -345,11 +356,22 @@ Coordinate a comprehensive codebase analysis through the pipeline."""
             
             return AnalysisResult(
                 project_id=self.project_id,
-                config_used=self.config.model_dump(),
-                agent_results=self.results,
+                analysis_run_id=self.analysis_run_id,
+                analysis_configuration={
+                    **self.config.model_dump(),
+                    "personas": self.selected_personas,
+                },
+                coordinator_output=coordinator_output,
+                semantic_analysis=semantic_output,
+                best_practice_findings=best_practice_output,
+                sde_report=sde_output,
+                pm_report=pm_output,
+                qa_report=qa_output,
                 execution_time_seconds=round(execution_time, 2),
                 success=False,
-                errors=self.errors
+                errors=self.errors,
+                created_at=result_created_at,
+                updated_at=datetime.now(timezone.utc),
             )
     
     def _extract_json(self, content: str) -> Dict[str, Any]:
@@ -417,14 +439,6 @@ Coordinate a comprehensive codebase analysis through the pipeline."""
         
         raise ValueError(f"No valid JSON found in content (first 200 chars): {content[:200]}")
     
-    def _save_result(self, result: AnalysisResult):
-        """Save analysis result to file"""
-        output_file = self.project_dir / "analysis_result.json"
-        with open(output_file, 'w') as f:
-            json.dump(result.model_dump(), f, indent=2)
-        print(f"\n💾 Results saved to {output_file}")
-
-
 # ============================================================================
 # Convenience Functions (Backward Compatible)
 # ============================================================================
