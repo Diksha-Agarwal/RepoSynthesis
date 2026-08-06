@@ -1,4 +1,6 @@
-from typing import Any, List, Literal, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, Field
 
@@ -40,31 +42,67 @@ class DeleteResponse(ActionResponse):
     project_id: int
 
 
-class PreprocessStatusResponse(BaseModel):
-    status: Literal["not_started", "running", "completed", "failed"]
-    current_step: Optional[str] = None
-    error: Optional[str] = None
-    error_code: Optional[str] = None
-
-
 class AnalysisRequest(BaseModel):
     personas: List[Literal["SDE", "PM"]] = Field(default_factory=lambda: ["SDE", "PM"], min_length=1)
     depth: Literal["quick", "standard", "deep"] = "standard"
     verbosity: Literal["low", "medium", "high"] = "medium"
 
 
-class AnalysisStartResponse(ActionResponse):
-    config: AnalysisRequest
+RunType = Literal["preprocessing", "analysis"]
+RunStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
 
 
-class AnalysisStatusResponse(BaseModel):
-    status: Literal["not_started", "running", "completed", "failed"]
-    progress: Optional[int] = Field(default=None, ge=0, le=100)
+class RunStartResponse(BaseModel):
+    run_id: UUID
+    project_id: int
+    run_type: RunType
+    status: Literal["queued"]
+    configuration: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RunResponse(BaseModel):
+    run_id: UUID
+    project_id: int
+    run_type: RunType
+    status: RunStatus
+    progress: int = Field(ge=0, le=100)
     current_activity: Optional[str] = None
+    error_message: Optional[str] = None
+    configuration: Dict[str, Any] = Field(default_factory=dict)
     logs: List[str] = Field(default_factory=list)
-    agent_insights: dict[str, Any] = Field(default_factory=dict)
+    agent_insights: Dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: datetime
+
+
+class RunListResponse(BaseModel):
+    runs: List[RunResponse]
+
+
+class LatestRunStatusResponse(BaseModel):
+    run_id: Optional[UUID] = None
+    project_id: int
+    run_type: RunType
+    status: Literal["not_started", "queued", "running", "completed", "failed", "cancelled"]
+    progress: int = Field(default=0, ge=0, le=100)
+    current_activity: Optional[str] = None
+    current_step: Optional[str] = None
+    error_message: Optional[str] = None
     error: Optional[str] = None
-    result: Optional[dict[str, Any]] = None
+    configuration: Dict[str, Any] = Field(default_factory=dict)
+    logs: List[str] = Field(default_factory=list)
+    agent_insights: Dict[str, Any] = Field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class LatestRunsResponse(BaseModel):
+    preprocessing: Optional[RunResponse] = None
+    analysis: Optional[RunResponse] = None
 
 
 class AnalysisResultResponse(BaseModel):

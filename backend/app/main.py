@@ -6,6 +6,7 @@ import traceback
 from pathlib import Path
 from threading import Thread
 from typing import Any
+from uuid import UUID
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -27,15 +28,27 @@ from api_schemas import (
     ActionResponse,
     AnalysisRequest,
     AnalysisResultResponse,
-    AnalysisStartResponse,
-    AnalysisStatusResponse,
     ChatRequest,
     ChatResponse,
-    PreprocessStatusResponse,
+    LatestRunsResponse,
+    LatestRunStatusResponse,
+    RunListResponse,
+    RunResponse,
+    RunStartResponse,
 )
 from db import Project
 from ingestion import IngestionError, SETTINGS, resolve_uploaded_zip
 from projects import get_project_or_404, router as projects_router
+from run_store import (
+    ActiveRunExistsError,
+    ProjectNotFoundError,
+    cancel_orphaned_active_runs,
+    create_run,
+    get_latest_run,
+    get_run,
+    list_project_runs,
+    update_run,
+)
 
 
 app = FastAPI(
@@ -54,11 +67,14 @@ app.include_router(projects_router)
 
 BASE_DATA_DIR = ROOT / "data" / "projects"
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-preprocess_status: dict[str, dict[str, Any]] = {}
-analysis_status: dict[str, dict[str, Any]] = {}
 project_chat_histories: dict[str, list] = {}
 vector_store_cache: dict[str, Any] = {}
 llm_instance = None
+
+
+@app.on_event("startup")
+def reconcile_interrupted_runs():
+    cancel_orphaned_active_runs()
 
 
 def _error_response(status_code: int, code: str, message: str, details: Any = None) -> JSONResponse:
@@ -108,17 +124,43 @@ async def unhandled_exception_handler(_: Request, exc: Exception):
     return _error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "An unexpected server error occurred")
 
 
-def run_preprocessing(project_id: str, file_path: str):
+def run_preprocessing(project_id: str, run_id: str, file_path: str):
     from pipeline import process_repository_for_graphflow
 
-    preprocess_status[project_id] = {"status": "running", "current_step": "Starting preprocessing..."}
+    progress_by_activity = {
+        "Loading repository files...": 10,
+        "Extracting code sections...": 30,
+        "Analyzing repository structure...": 50,
+        "Generating embeddings...": 70,
+        "Saving project data...": 90,
+    }
     try:
+        update_run(
+            run_id,
+            status="running",
+            progress=1,
+            current_activity="Starting preprocessing...",
+            log_message="Preprocessing started",
+        )
+
         def update_step(message: str):
-            preprocess_status[project_id] = {"status": "running", "current_step": message}
+            progress = progress_by_activity.get(message, 5)
+            update_run(
+                run_id,
+                progress=progress,
+                current_activity=message,
+                log_message=f"[{progress}%] {message}",
+            )
 
         update_step("Cloning GitHub repository..." if file_path.startswith("http") else "Extracting ZIP file...")
         process_repository_for_graphflow(file_path, project_id=project_id, status_callback=update_step)
-        preprocess_status[project_id] = {"status": "completed", "current_step": "Preprocessing complete"}
+        update_run(
+            run_id,
+            status="completed",
+            progress=100,
+            current_activity="Preprocessing complete",
+            log_message="[100%] Preprocessing complete",
+        )
         vector_store_cache.pop(project_id, None)
     except Exception as exc:
         traceback.print_exc()
@@ -128,13 +170,16 @@ def run_preprocessing(project_id: str, file_path: str):
             message = "Invalid file path or GitHub URL."
         else:
             message = str(exc)
-        failure = {"status": "failed", "error": message}
-        if isinstance(exc, IngestionError):
-            failure["error_code"] = exc.code
-        preprocess_status[project_id] = failure
+        update_run(
+            run_id,
+            status="failed",
+            current_activity="Preprocessing failed",
+            error_message=message,
+            log_message=f"Preprocessing failed: {message}",
+        )
 
 
-@app.post("/projects/{project_id}/preprocess", response_model=ActionResponse)
+@app.post("/projects/{project_id}/preprocess", response_model=RunStartResponse)
 async def preprocess_project(project: Project = Depends(get_project_or_404)):
     file_path = project.zip_filename or project.github_url
     if not file_path:
@@ -145,28 +190,73 @@ async def preprocess_project(project: Project = Depends(get_project_or_404)):
         except IngestionError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
 
-    project_id = str(project.id)
-    Thread(target=run_preprocessing, args=(project_id, str(file_path)), daemon=True).start()
-    return ActionResponse(status="started")
-
-
-@app.get("/projects/{project_id}/preprocess/status", response_model=PreprocessStatusResponse)
-async def get_preprocess_status(project: Project = Depends(get_project_or_404)):
-    project_id = str(project.id)
-    return preprocess_status.get(project_id, {"status": "not_started", "current_step": "Not started"})
-
-
-async def run_graphflow_analysis(project_id: str, personas: str = "SDE,PM", depth: str = "standard", verbosity: str = "medium"):
-    def update(activity: str, progress: int, insight: str = None):
-        if project_id in analysis_status:
-            current_status = analysis_status[project_id]
-            current_status["current_activity"] = activity
-            current_status["progress"] = progress
-            current_status["logs"].append(f"[{progress}%] {activity}")
-            if insight:
-                current_status["agent_insights"][activity] = insight
+    configuration = {"source_type": "zip" if project.zip_filename else "github"}
+    try:
+        run = create_run(project.id, "preprocessing", configuration)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from exc
+    except ActiveRunExistsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "active_run_exists", "message": "A preprocessing run is already queued or running"},
+        ) from exc
 
     try:
+        Thread(
+            target=run_preprocessing,
+            args=(str(project.id), run["run_id"], str(file_path)),
+            daemon=True,
+        ).start()
+    except Exception as exc:
+        update_run(
+            run["run_id"],
+            status="failed",
+            current_activity="Unable to start preprocessing",
+            error_message=str(exc),
+        )
+        raise
+    return RunStartResponse(**run)
+
+
+@app.get("/projects/{project_id}/preprocess/status", response_model=LatestRunStatusResponse)
+async def get_preprocess_status(project: Project = Depends(get_project_or_404)):
+    run = get_latest_run(project.id, "preprocessing")
+    if not run:
+        return LatestRunStatusResponse(
+            project_id=project.id,
+            run_type="preprocessing",
+            status="not_started",
+            current_activity="Not started",
+            current_step="Not started",
+        )
+    return LatestRunStatusResponse(**run, current_step=run["current_activity"], error=run["error_message"])
+
+
+async def run_graphflow_analysis(
+    project_id: str,
+    run_id: str,
+    personas: str = "SDE,PM",
+    depth: str = "standard",
+    verbosity: str = "medium",
+):
+    def update(activity: str, progress: int, insight: str = None):
+        update_run(
+            run_id,
+            progress=progress,
+            current_activity=activity,
+            log_message=f"[{progress}%] {activity}",
+            insight_activity=activity if insight else None,
+            insight=insight,
+        )
+
+    try:
+        update_run(
+            run_id,
+            status="running",
+            progress=1,
+            current_activity="Starting analysis...",
+            log_message="Analysis started",
+        )
         from app.config.analysis_config import AnalysisConfig, FeaturesEnabled
         from app.teams.graphflow_team import GraphFlowCoordinator
 
@@ -189,10 +279,14 @@ async def run_graphflow_analysis(project_id: str, personas: str = "SDE,PM", dept
         update("Running agent pipeline...", 10)
         result = await coordinator.run_analysis()
         if not result.success:
-            analysis_status[project_id] = {
-                "status": "failed",
-                "error": "; ".join(result.errors) if result.errors else "Unknown agent error",
-            }
+            error_message = "; ".join(result.errors) if result.errors else "Unknown agent error"
+            update_run(
+                run_id,
+                status="failed",
+                current_activity="Analysis failed",
+                error_message=error_message,
+                log_message=f"Analysis failed: {error_message}",
+            )
             return
 
         result_data = {
@@ -205,44 +299,93 @@ async def run_graphflow_analysis(project_id: str, personas: str = "SDE,PM", dept
         project_dir.mkdir(parents=True, exist_ok=True)
         with (project_dir / "analysis_result.json").open("w", encoding="utf-8") as result_file:
             json.dump(result_data, result_file, indent=2)
-        analysis_status[project_id] = {"status": "completed", "result": result_data}
+        update_run(
+            run_id,
+            status="completed",
+            progress=100,
+            current_activity="Analysis complete",
+            log_message="[100%] Analysis complete",
+        )
     except Exception as exc:
         traceback.print_exc()
-        analysis_status[project_id] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+        error_message = f"{type(exc).__name__}: {exc}"
+        update_run(
+            run_id,
+            status="failed",
+            current_activity="Analysis failed",
+            error_message=error_message,
+            log_message=f"Analysis failed: {error_message}",
+        )
 
 
-@app.post("/projects/{project_id}/analyze/graphflow", response_model=AnalysisStartResponse)
+@app.post("/projects/{project_id}/analyze/graphflow", response_model=RunStartResponse)
 async def start_analysis(payload: AnalysisRequest, project: Project = Depends(get_project_or_404)):
     project_id = str(project.id)
     project_dir = BASE_DATA_DIR / project_id
     if not (project_dir / "context.json").exists() or not (project_dir / "vector_store").exists():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run preprocessing before analysis")
 
-    analysis_status[project_id] = {
-        "status": "running",
-        "progress": 0,
-        "current_activity": "Starting analysis...",
-        "logs": ["Analysis queued"],
-        "agent_insights": {},
+    configuration = {
+        "personas": payload.personas,
+        "depth": payload.depth,
+        "verbosity": payload.verbosity,
     }
+    try:
+        run = create_run(project.id, "analysis", configuration)
+    except ProjectNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from exc
+    except ActiveRunExistsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "active_run_exists", "message": "An analysis run is already queued or running"},
+        ) from exc
+
     personas = ",".join(payload.personas)
-    asyncio.create_task(run_graphflow_analysis(project_id, personas, payload.depth, payload.verbosity))
-    return AnalysisStartResponse(status="started", config=payload)
+    try:
+        asyncio.create_task(run_graphflow_analysis(project_id, run["run_id"], personas, payload.depth, payload.verbosity))
+    except Exception as exc:
+        update_run(
+            run["run_id"],
+            status="failed",
+            current_activity="Unable to start analysis",
+            error_message=str(exc),
+        )
+        raise
+    return RunStartResponse(**run)
 
 
-@app.get("/projects/{project_id}/status", response_model=AnalysisStatusResponse)
+@app.get("/projects/{project_id}/status", response_model=LatestRunStatusResponse)
 async def get_status(project: Project = Depends(get_project_or_404)):
-    project_id = str(project.id)
-    if project_id in analysis_status:
-        return analysis_status[project_id]
-    result_file = BASE_DATA_DIR / project_id / "analysis_result.json"
-    if result_file.exists():
-        try:
-            with result_file.open("r", encoding="utf-8") as source:
-                return {"status": "completed", "result": json.load(source)}
-        except (OSError, json.JSONDecodeError):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Stored analysis result could not be read")
-    return {"status": "not_started"}
+    run = get_latest_run(project.id, "analysis")
+    if not run:
+        return LatestRunStatusResponse(project_id=project.id, run_type="analysis", status="not_started")
+    return LatestRunStatusResponse(**run, error=run["error_message"])
+
+
+@app.get("/projects/{project_id}/runs", response_model=RunListResponse)
+async def get_project_runs(project: Project = Depends(get_project_or_404)):
+    return RunListResponse(runs=[RunResponse(**run) for run in list_project_runs(project.id)])
+
+
+@app.get("/projects/{project_id}/runs/latest", response_model=LatestRunsResponse)
+async def get_latest_project_runs(project: Project = Depends(get_project_or_404)):
+    preprocessing = get_latest_run(project.id, "preprocessing")
+    analysis = get_latest_run(project.id, "analysis")
+    return LatestRunsResponse(
+        preprocessing=RunResponse(**preprocessing) if preprocessing else None,
+        analysis=RunResponse(**analysis) if analysis else None,
+    )
+
+
+@app.get("/projects/{project_id}/runs/{run_id}", response_model=RunResponse)
+async def get_project_run(run_id: UUID, project: Project = Depends(get_project_or_404)):
+    run = get_run(project.id, str(run_id))
+    if not run:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"code": "run_not_found", "message": "Run not found for this project"},
+        )
+    return RunResponse(**run)
 
 
 @app.get("/projects/{project_id}/result", response_model=AnalysisResultResponse)
@@ -305,8 +448,9 @@ async def ask(payload: ChatRequest, project: Project = Depends(get_project_or_40
                     )
             except (OSError, json.JSONDecodeError):
                 pass
-        if not analysis_context and analysis_status.get(project_id, {}).get("status") == "running":
-            insights = analysis_status[project_id].get("agent_insights", {})
+        latest_analysis_run = get_latest_run(project.id, "analysis")
+        if not analysis_context and latest_analysis_run and latest_analysis_run["status"] == "running":
+            insights = latest_analysis_run.get("agent_insights", {})
             snippets = [f"{activity}: {str(insight)[:400]}" for activity, insight in list(insights.items())[:3] if insight]
             if snippets:
                 using_partial = True
