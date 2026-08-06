@@ -49,6 +49,7 @@ from run_store import (
     ActiveRunExistsError,
     ProjectNotFoundError,
     create_run,
+    get_active_run,
     get_analysis_result,
     get_latest_completed_analysis_result,
     get_latest_run,
@@ -101,8 +102,8 @@ app.include_router(projects_router)
 
 BASE_DATA_DIR = SETTINGS.data_dir / "projects"
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
-project_chat_histories: dict[str, list] = {}
-vector_store_cache: dict[str, tuple[int, Any]] = {}
+project_chat_histories: dict[int, list] = {}
+vector_store_cache: dict[int, tuple[int, Any]] = {}
 llm_instance = None
 
 
@@ -200,7 +201,11 @@ async def preprocess_project(project: Project = Depends(get_project_or_404)):
     except ActiveRunExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "active_run_exists", "message": "A preprocessing run is already queued or running"},
+            detail={
+                "code": "active_project_run_exists",
+                "message": "Another preprocessing or analysis job is already queued or running for this project",
+                "details": {"active_run_id": exc.run_id, "run_type": exc.run_type},
+            },
         ) from exc
 
     try:
@@ -208,7 +213,7 @@ async def preprocess_project(project: Project = Depends(get_project_or_404)):
             run["run_id"],
             "preprocessing",
             run_preprocessing_job,
-            str(project.id),
+            project.id,
             run["run_id"],
             str(file_path),
         )
@@ -243,10 +248,50 @@ async def get_preprocess_status(project: Project = Depends(get_project_or_404)):
 
 @app.post("/projects/{project_id}/analyze/graphflow", response_model=RunStartResponse)
 async def start_analysis(payload: AnalysisRequest, project: Project = Depends(get_project_or_404)):
-    project_id = str(project.id)
-    project_dir = BASE_DATA_DIR / project_id
+    project_id = project.id
+    active_run = get_active_run(project_id)
+    if active_run:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "active_project_run_exists",
+                "message": "Another preprocessing or analysis job is already queued or running for this project",
+                "details": {
+                    "active_run_id": active_run["run_id"],
+                    "run_type": active_run["run_type"],
+                },
+            },
+        )
+    latest_preprocessing = get_latest_run(project_id, "preprocessing")
+    if latest_preprocessing is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "preprocessing_required",
+                "message": "A completed preprocessing run is required before analysis",
+            },
+        )
+    if latest_preprocessing["status"] != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "latest_preprocessing_not_completed",
+                "message": "The latest preprocessing run must be completed before analysis",
+                "details": {
+                    "preprocessing_run_id": latest_preprocessing["run_id"],
+                    "status": latest_preprocessing["status"],
+                },
+            },
+        )
+    project_dir = BASE_DATA_DIR / str(project_id)
     if not (project_dir / "context.json").exists() or not (project_dir / "vector_store").exists():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run preprocessing before analysis")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "preprocessing_artifacts_missing",
+                "message": "The latest completed preprocessing artifacts are unavailable; run preprocessing again",
+            },
+        )
 
     configuration = {
         "personas": payload.personas,
@@ -260,7 +305,11 @@ async def start_analysis(payload: AnalysisRequest, project: Project = Depends(ge
     except ActiveRunExistsError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail={"code": "active_run_exists", "message": "An analysis run is already queued or running"},
+            detail={
+                "code": "active_project_run_exists",
+                "message": "Another preprocessing or analysis job is already queued or running for this project",
+                "details": {"active_run_id": exc.run_id, "run_type": exc.run_type},
+            },
         ) from exc
 
     personas = ",".join(payload.personas)
@@ -385,8 +434,8 @@ async def ask(payload: ChatRequest, project: Project = Depends(get_project_or_40
 
     global llm_instance
     start = time.time()
-    project_id = str(project.id)
-    project_dir = BASE_DATA_DIR / project_id
+    project_id = project.id
+    project_dir = BASE_DATA_DIR / str(project_id)
     if not (project_dir / "vector_store").exists():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run preprocessing before asking questions")
 
@@ -467,14 +516,14 @@ async def ask(payload: ChatRequest, project: Project = Depends(get_project_or_40
 
 @app.post("/projects/{project_id}/chat/clear", response_model=ActionResponse)
 async def clear_chat_memory(project: Project = Depends(get_project_or_404)):
-    project_id = str(project.id)
+    project_id = project.id
     had_history = bool(project_chat_histories.pop(project_id, None))
     return ActionResponse(status="cleared" if had_history else "no_history")
 
 
 @app.post("/projects/{project_id}/cache/clear", response_model=ActionResponse)
 async def clear_cache(project: Project = Depends(get_project_or_404)):
-    project_id = str(project.id)
+    project_id = project.id
     had_cache = vector_store_cache.pop(project_id, None) is not None
     return ActionResponse(status="cache_cleared" if had_cache else "no_cache")
 

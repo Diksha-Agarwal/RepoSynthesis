@@ -151,13 +151,13 @@ TEMPLATES = {
 }
 
 
-def load_config(project_id: str) -> AnalysisConfig:
+def load_config(project_id: int) -> AnalysisConfig:
     """
     Load analysis config for a project.
     First checks for project-specific config, then falls back to default.
     
     Args:
-        project_id: Project UUID
+        project_id: Numeric database project ID
         
     Returns:
         AnalysisConfig instance
@@ -173,12 +173,12 @@ def load_config(project_id: str) -> AnalysisConfig:
         return AnalysisConfig()
 
 
-def save_config(project_id: str, config: AnalysisConfig) -> None:
+def save_config(project_id: int, config: AnalysisConfig) -> None:
     """
     Save analysis config for a project.
     
     Args:
-        project_id: Project UUID
+        project_id: Numeric database project ID
         config: AnalysisConfig to save
     """
     config_path = Path(f"data/projects/{project_id}/analysis_config.json")

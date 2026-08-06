@@ -65,6 +65,8 @@ curl.exe http://localhost:8000/projects/1/result
 
 Starting the same run type twice while it is queued or running returns HTTP 409. Stopping Redis makes `/ready` and new enqueue requests return HTTP 503 with the shared JSON error envelope.
 
+Only one preprocessing or analysis run may be queued or running for a project at a time. Project deletion is also rejected with HTTP 409 while a run is active. Analysis requires the newest preprocessing run to be completed, even when artifacts from an older successful run are still present.
+
 To verify ZIP ingestion, replace the path below with a small valid archive. The first command should return HTTP 201; the second should return HTTP 400 with `invalid_file_type`.
 
 ```powershell

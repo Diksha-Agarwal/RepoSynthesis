@@ -26,7 +26,6 @@ class IngestionError(ValueError):
 
 _OWNER_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _REPO_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
-_PROJECT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{index}" for index in range(1, 10)),
@@ -34,11 +33,16 @@ _WINDOWS_RESERVED_NAMES = {
 }
 
 
-def validate_project_id(project_id: str) -> str:
-    project_id = str(project_id)
-    if not _PROJECT_ID_PATTERN.fullmatch(project_id):
-        raise IngestionError("invalid_project_id", "Project ID contains unsupported characters")
-    return project_id
+def validate_project_id(project_id: int) -> int:
+    if isinstance(project_id, bool):
+        raise IngestionError("invalid_project_id", "Project ID must be a positive integer")
+    try:
+        numeric_project_id = int(project_id)
+    except (TypeError, ValueError) as exc:
+        raise IngestionError("invalid_project_id", "Project ID must be a positive integer") from exc
+    if numeric_project_id <= 0 or str(project_id) != str(numeric_project_id):
+        raise IngestionError("invalid_project_id", "Project ID must be a positive integer")
+    return numeric_project_id
 
 
 def validate_github_url(url: str) -> str:

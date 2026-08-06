@@ -41,7 +41,7 @@ class AnalysisRun(BaseModel):
     
     # Run identification
     run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
-    project_id: str
+    project_id: int
     
     # Status tracking
     status: RunStatus = RunStatus.RUNNING

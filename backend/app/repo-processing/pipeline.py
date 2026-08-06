@@ -1,5 +1,4 @@
 import os
-import uuid
 from repo_loader import RepoLoader
 from code_extractor import CodeExtractor
 from repo_intel import RepoIntel
@@ -64,7 +63,7 @@ def process_repository(file_path: str):
     #     print(res['content'][:200], "...") # print first 200 chars
     #     print("-----")
 
-def process_repository_for_graphflow(file_path: str, project_id: str = None, status_callback=None):
+def process_repository_for_graphflow(file_path: str, project_id: int, status_callback=None):
     """
     NEW FUNCTION: Process repository and prepare it for GraphFlow analysis.
     
@@ -72,14 +71,14 @@ def process_repository_for_graphflow(file_path: str, project_id: str = None, sta
     
     Args:
         file_path: Path to ZIP file or GitHub URL
-        project_id: Optional project ID (generates UUID if not provided)
+        project_id: Numeric database project ID
         status_callback: Optional callback function for progress updates
     
     Returns:
         tuple: (project_id, project_dir_path)
         
     Example:
-        project_id, project_dir = process_repository_for_graphflow("repo.zip")
+        project_id, project_dir = process_repository_for_graphflow("repo.zip", project_id=1)
         
         # Then call GraphFlow endpoint:
         import requests
@@ -88,9 +87,6 @@ def process_repository_for_graphflow(file_path: str, project_id: str = None, sta
         )
     """
     
-    # Generate project_id if not provided
-    if not project_id:
-        project_id = str(uuid.uuid4())
     project_id = validate_project_id(project_id)
     
     print(f"\n{'='*80}")
@@ -105,6 +101,7 @@ def process_repository_for_graphflow(file_path: str, project_id: str = None, sta
         print("1️⃣ Loading repository...")
         repo_path = RepoLoader.load_repo(file_path)
         docs = RepoLoader.load_documents(repo_path)
+        repository_files = sorted({doc.metadata["source"] for doc in docs})
         print(f"   ✓ Loaded {len(docs)} documents\n")
         
         if not docs:
@@ -151,6 +148,7 @@ def process_repository_for_graphflow(file_path: str, project_id: str = None, sta
             project_id=project_id,
             repo_analysis=repo_analysis,
             sections_count=len(sections),
+            repository_files=repository_files,
             faiss_store=emb_model.store
         )
         
@@ -181,7 +179,7 @@ if __name__ == "__main__":
     zip_file = "C:\\path\\to\\your\\repo.zip"  # CHANGE THIS
     
     # Process for GraphFlow
-    project_id, project_dir = process_repository_for_graphflow(zip_file)
+    project_id, project_dir = process_repository_for_graphflow(zip_file, project_id=1)
     
     print("\n" + "="*80)
     print("To run GraphFlow analysis, call:")

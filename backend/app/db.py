@@ -78,11 +78,11 @@ class AnalysisRun(Base):
         CheckConstraint("progress >= 0 AND progress <= 100", name="ck_analysis_runs_progress"),
         Index("ix_analysis_runs_project_created", "project_id", "created_at"),
         Index(
-            "uq_analysis_runs_active_type",
+            "uq_analysis_runs_active_project",
             "project_id",
-            "run_type",
             unique=True,
             sqlite_where=text("status IN ('queued', 'running')"),
+            postgresql_where=text("status IN ('queued', 'running')"),
         ),
     )
 
@@ -130,6 +130,9 @@ class AnalysisResultRecord(Base):
 
 
 Base.metadata.create_all(bind=engine)
+if _IS_SQLITE:
+    with engine.begin() as connection:
+        connection.execute(text("DROP INDEX IF EXISTS uq_analysis_runs_active_type"))
 
 
 def get_db():

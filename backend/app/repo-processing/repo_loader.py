@@ -153,7 +153,13 @@ class RepoLoader:
                     else:
                         content = read_file_safe(file_path)
                     if content.strip():
-                        documents.append(Document(page_content=content, metadata={"source": file_path}))
+                        relative_path = Path(file_path).resolve().relative_to(repo_root).as_posix()
+                        documents.append(
+                            Document(
+                                page_content=content,
+                                metadata={"source": relative_path, "path": relative_path},
+                            )
+                        )
 
             print(f"Loaded {len(documents)} documents from {repo_path}")
             return documents

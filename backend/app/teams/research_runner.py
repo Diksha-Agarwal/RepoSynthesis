@@ -34,7 +34,7 @@ class ResearchRunner:
     5. Uses AutoGen lifecycle hooks (save_state, load_state, on_pause, on_resume)
     """
     
-    def __init__(self, project_id: str, config: Optional[AnalysisConfig] = None):
+    def __init__(self, project_id: int, config: Optional[AnalysisConfig] = None):
         self.project_id = project_id
         self.project_dir = Path(f"data/projects/{project_id}")
         self.config = config if config else AnalysisConfig()

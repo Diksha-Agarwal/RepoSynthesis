@@ -235,7 +235,7 @@ class QAOutput(BaseModel):
 class AnalysisResult(BaseModel):
     """Canonical analysis result returned by GraphFlow and the public API."""
 
-    project_id: str = Field(description="Project identifier")
+    project_id: int = Field(gt=0, description="Numeric project identifier")
     analysis_run_id: UUID = Field(description="Persistent analysis run UUID")
     analysis_configuration: Dict[str, Any] = Field(description="Analysis configuration used")
     coordinator_output: Optional[CoordinatorOutput] = Field(default=None, description="Coordinator analysis")

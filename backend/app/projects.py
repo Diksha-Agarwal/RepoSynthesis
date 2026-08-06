@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Path as FastA
 from sqlalchemy.orm import Session
 
 from api_schemas import DeleteResponse, ProjectCreateRequest, ProjectListResponse, ProjectResponse
-from db import DATA_DIR, Project, get_db
+from db import AnalysisRun, DATA_DIR, Project, get_db
 from ingestion import (
     IngestionError,
     SETTINGS,
@@ -148,6 +148,24 @@ def retrieve_project(project: Project = Depends(get_project_or_404)):
 @router.delete("/{project_id}", response_model=DeleteResponse)
 def delete_project(project: Project = Depends(get_project_or_404), db: Session = Depends(get_db)):
     project_id = project.id
+    active_run = (
+        db.query(AnalysisRun)
+        .filter(
+            AnalysisRun.project_id == project_id,
+            AnalysisRun.status.in_(("queued", "running")),
+        )
+        .order_by(AnalysisRun.created_at.desc())
+        .first()
+    )
+    if active_run:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "active_project_run_exists",
+                "message": "Project cannot be deleted while preprocessing or analysis is active",
+                "details": {"active_run_id": active_run.id, "run_type": active_run.run_type},
+            },
+        )
     zip_path = Path(project.zip_filename) if project.zip_filename else None
     db.delete(project)
     db.commit()

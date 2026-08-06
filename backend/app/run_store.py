@@ -13,7 +13,10 @@ RUN_TYPES = ("preprocessing", "analysis")
 
 
 class ActiveRunExistsError(RuntimeError):
-    pass
+    def __init__(self, run_id: str, run_type: Optional[str] = None):
+        super().__init__(run_id)
+        self.run_id = run_id
+        self.run_type = run_type
 
 
 class ProjectNotFoundError(RuntimeError):
@@ -56,13 +59,12 @@ def create_run(project_id: int, run_type: str, configuration: Optional[Dict[str,
             db.query(AnalysisRun)
             .filter(
                 AnalysisRun.project_id == project_id,
-                AnalysisRun.run_type == run_type,
                 AnalysisRun.status.in_(ACTIVE_STATUSES),
             )
             .first()
         )
         if active_run:
-            raise ActiveRunExistsError(active_run.id)
+            raise ActiveRunExistsError(active_run.id, active_run.run_type)
 
         run = AnalysisRun(
             id=str(uuid4()),
@@ -80,7 +82,18 @@ def create_run(project_id: int, run_type: str, configuration: Optional[Dict[str,
             db.commit()
         except IntegrityError as exc:
             db.rollback()
-            raise ActiveRunExistsError("active") from exc
+            active_run = (
+                db.query(AnalysisRun)
+                .filter(
+                    AnalysisRun.project_id == project_id,
+                    AnalysisRun.status.in_(ACTIVE_STATUSES),
+                )
+                .first()
+            )
+            raise ActiveRunExistsError(
+                active_run.id if active_run else "active",
+                active_run.run_type if active_run else None,
+            ) from exc
         db.refresh(run)
         return run_to_dict(run)
 
@@ -158,6 +171,20 @@ def list_active_runs() -> List[Dict[str, Any]]:
         return [run_to_dict(run) for run in runs]
 
 
+def get_active_run(project_id: int) -> Optional[Dict[str, Any]]:
+    with SessionLocal() as db:
+        run = (
+            db.query(AnalysisRun)
+            .filter(
+                AnalysisRun.project_id == project_id,
+                AnalysisRun.status.in_(ACTIVE_STATUSES),
+            )
+            .order_by(AnalysisRun.created_at.desc())
+            .first()
+        )
+        return run_to_dict(run) if run else None
+
+
 def get_latest_run(project_id: int, run_type: str) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         run = (
@@ -177,6 +204,9 @@ def finalize_analysis_run(
     success: bool,
     error_message: Optional[str] = None,
 ) -> None:
+    payload = dict(payload)
+    payload["project_id"] = project_id
+    payload["analysis_run_id"] = run_id
     with SessionLocal() as db:
         run = (
             db.query(AnalysisRun)
@@ -231,7 +261,11 @@ def get_analysis_result(project_id: int, run_id: str) -> Optional[Dict[str, Any]
             )
             .first()
         )
-        return dict(record.payload) if record else None
+        if not record:
+            return None
+        payload = dict(record.payload)
+        payload["project_id"] = record.project_id
+        return payload
 
 
 def get_latest_completed_analysis_result(project_id: int) -> Optional[Dict[str, Any]]:
@@ -247,7 +281,11 @@ def get_latest_completed_analysis_result(project_id: int) -> Optional[Dict[str, 
             .order_by(AnalysisRun.completed_at.desc(), AnalysisResultRecord.created_at.desc())
             .first()
         )
-        return dict(record.payload) if record else None
+        if not record:
+            return None
+        payload = dict(record.payload)
+        payload["project_id"] = record.project_id
+        return payload
 
 
 def list_completed_analysis_results(project_id: int) -> List[Dict[str, Any]]:
@@ -263,4 +301,9 @@ def list_completed_analysis_results(project_id: int) -> List[Dict[str, Any]]:
             .order_by(AnalysisRun.completed_at.desc(), AnalysisResultRecord.created_at.desc())
             .all()
         )
-        return [dict(record.payload) for record in records]
+        results = []
+        for record in records:
+            payload = dict(record.payload)
+            payload["project_id"] = record.project_id
+            results.append(payload)
+        return results

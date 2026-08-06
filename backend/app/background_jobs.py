@@ -28,7 +28,7 @@ def _failure_message(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def run_preprocessing_job(project_id: str, run_id: str, file_path: str) -> None:
+def run_preprocessing_job(project_id: int, run_id: str, file_path: str) -> None:
     from pipeline import process_repository_for_graphflow
 
     progress_by_activity = {
@@ -56,7 +56,7 @@ def run_preprocessing_job(project_id: str, run_id: str, file_path: str) -> None:
         raise
 
 
-async def _run_analysis(project_id: str, run_id: str, personas: str, depth: str, verbosity: str) -> None:
+async def _run_analysis(project_id: int, run_id: str, personas: str, depth: str, verbosity: str) -> None:
     def update(activity: str, progress: int, insight: str | None = None) -> None:
         update_run(
             run_id,
@@ -83,16 +83,16 @@ async def _run_analysis(project_id: str, run_id: str, personas: str, depth: str,
         request_timeout=SETTINGS.openai_request_timeout_seconds,
     )
     update("Creating analysis coordinator...", 5)
-    coordinator = GraphFlowCoordinator(project_id, config, project_dir=BASE_DATA_DIR / project_id, analysis_run_id=run_id)
+    coordinator = GraphFlowCoordinator(project_id, config, project_dir=BASE_DATA_DIR / str(project_id), analysis_run_id=run_id)
     coordinator.selected_personas = personas_list
     coordinator.status_callback = update
     update("Running agent pipeline...", 10)
     result = await coordinator.run_analysis()
     error_message = "; ".join(result.errors) if result.errors else None
-    finalize_analysis_run(int(project_id), run_id, result.model_dump(mode="json"), success=result.success, error_message=error_message)
+    finalize_analysis_run(project_id, run_id, result.model_dump(mode="json"), success=result.success, error_message=error_message)
 
 
-def run_analysis_job(project_id: str, run_id: str, personas: str, depth: str, verbosity: str) -> None:
+def run_analysis_job(project_id: int, run_id: str, personas: str, depth: str, verbosity: str) -> None:
     logger.info("analysis_started", extra={"project_id": project_id, "run_id": run_id})
     try:
         asyncio.run(_run_analysis(project_id, run_id, personas, depth, verbosity))

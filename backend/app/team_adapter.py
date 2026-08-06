@@ -2,6 +2,7 @@
 Adapter to convert preprocessor output to GraphFlow format
 """
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any
 from ingestion import validate_project_id
@@ -12,9 +13,10 @@ _BASE_DATA_DIR = SETTINGS.data_dir / "projects"
 
 
 def create_graphflow_context(
-    project_id: str,
+    project_id: int,
     repo_analysis: Dict[str, Any],
     sections_count: int,
+    repository_files: list[str],
     output_dir: str = None
 ) -> Dict[str, Any]:
     if output_dir is None:
@@ -28,8 +30,6 @@ def create_graphflow_context(
     # Extract stack info with fallbacks
     stack = repo_analysis.get("stack", "Unknown")
     framework = repo_analysis.get("framework", "None")
-    entry_points = repo_analysis.get("entry_points", [])
-    
     # Determine primary language from stack
     if isinstance(stack, str) and stack != "Unknown":
         primary_language = stack.split()[0]
@@ -39,17 +39,17 @@ def create_graphflow_context(
     # Build context
     context = {
         "project_id": project_id,
-        "repo_root": entry_points[0] if entry_points else "unknown",
-        "analyzed_at": "2025-11-19T00:00:00Z",  # Could use datetime.utcnow().isoformat()
+        "repo_root": ".",
+        "analyzed_at": datetime.now(timezone.utc).isoformat(),
         "metadata": {
             "primary_language": primary_language,
             "languages": [primary_language],  # Could extract from stack
             "frameworks": [framework] if framework != "None" else [],
-            "total_files": sections_count,  # Approximation
+            "total_files": len(repository_files),
             "total_chunks": sections_count,
             "total_size_mb": 0.0  # Optional field
         },
-        "files": [],  # Optional - GraphFlow doesn't use this
+        "files": repository_files,
         "vector_store_path": f"{output_dir}/{project_id}/vector_store",
         "chunk_count": sections_count
     }
@@ -58,9 +58,10 @@ def create_graphflow_context(
 
 
 def save_for_graphflow(
-    project_id: str,
+    project_id: int,
     repo_analysis: Dict[str, Any],
     sections_count: int,
+    repository_files: list[str],
     faiss_store,
     output_dir: str = None
 ) -> str:
@@ -84,8 +85,6 @@ def save_for_graphflow(
         IOError: If file operations fail
     """
     # Validate inputs
-    if not project_id or not isinstance(project_id, str):
-        raise ValueError("project_id must be a non-empty string")
     project_id = validate_project_id(project_id)
     
     if not repo_analysis or not isinstance(repo_analysis, dict):
@@ -96,7 +95,7 @@ def save_for_graphflow(
     
     # Create project directory
     output_path = Path(output_dir).resolve()
-    project_dir = (output_path / project_id).resolve()
+    project_dir = (output_path / str(project_id)).resolve()
     try:
         project_dir.relative_to(output_path)
     except ValueError as exc:
@@ -108,6 +107,7 @@ def save_for_graphflow(
         project_id=project_id,
         repo_analysis=repo_analysis,
         sections_count=sections_count,
+        repository_files=repository_files,
         output_dir=output_dir
     )
     

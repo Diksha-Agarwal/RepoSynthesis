@@ -36,7 +36,7 @@ class GraphFlowCoordinator:
     
     def __init__(
         self,
-        project_id: str,
+        project_id: int,
         config: Optional[AnalysisConfig] = None,
         project_dir: Optional[Path] = None,
         analysis_run_id: Optional[str] = None,
@@ -45,7 +45,7 @@ class GraphFlowCoordinator:
         Initialize the coordinator.
         
         Args:
-            project_id: UUID of the project to analyze
+            project_id: Numeric database project ID
             config: Optional analysis config (will load from file if None)
             project_dir: Optional absolute path to project directory (for deployment flexibility)
         """
@@ -444,14 +444,14 @@ Coordinate a comprehensive codebase analysis through the pipeline."""
 # ============================================================================
 
 async def run_analysis_pipeline(
-    project_id: str,
+    project_id: int,
     config: Optional[AnalysisConfig] = None
 ) -> AnalysisResult:
     """
     Run the GraphFlow analysis pipeline for a project.
     
     Args:
-        project_id: Project UUID
+        project_id: Numeric database project ID
         config: Optional analysis configuration
         
     Returns:
