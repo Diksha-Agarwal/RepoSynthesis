@@ -1,4 +1,3 @@
-import shutil
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -8,11 +7,42 @@ from sqlalchemy.orm import Session
 
 from api_schemas import DeleteResponse, ProjectCreateRequest, ProjectListResponse, ProjectResponse
 from db import DATA_DIR, Project, get_db
+from ingestion import (
+    IngestionError,
+    SETTINGS,
+    inspect_zip_archive,
+    require_public_github_repository,
+)
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
-UPLOADS_DIR = DATA_DIR / "uploads"
+UPLOADS_DIR = SETTINGS.uploads_dir
 PROJECTS_DIR = DATA_DIR / "projects"
+
+
+def _raise_ingestion_error(exc: IngestionError):
+    raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+
+
+def _store_uploaded_zip(file: UploadFile) -> Path:
+    destination = UPLOADS_DIR / f"{uuid4().hex}.zip"
+    uploaded_size = 0
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with destination.open("xb") as output:
+            while True:
+                chunk = file.file.read(1024 * 1024)
+                if not chunk:
+                    break
+                uploaded_size += len(chunk)
+                if uploaded_size > SETTINGS.max_upload_zip_bytes:
+                    raise IngestionError("upload_too_large", "Uploaded ZIP exceeds the configured size limit", 413)
+                output.write(chunk)
+        inspect_zip_archive(destination)
+        return destination
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 def _project_response(project: Project) -> ProjectResponse:
@@ -38,7 +68,10 @@ def get_project_or_404(
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
 def create_github_project(payload: ProjectCreateRequest, db: Session = Depends(get_db)):
     """Create a project sourced from a public GitHub URL."""
-    github_url = str(payload.github_url)
+    try:
+        github_url = require_public_github_repository(str(payload.github_url))
+    except IngestionError as exc:
+        _raise_ingestion_error(exc)
     name = (payload.name or "").strip() or github_url.rstrip("/").split("/")[-1]
     project = Project(name=name, github_url=github_url)
     db.add(project)
@@ -68,23 +101,33 @@ def upload_project(
     project_name = name.strip() if name else None
     if file:
         if not file.filename or not file.filename.lower().endswith(".zip"):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file must be a ZIP archive")
-        UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
-        safe_filename = Path(file.filename).name
-        zip_filename = UPLOADS_DIR / f"{uuid4().hex}_{safe_filename}"
-        with zip_filename.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        project_name = project_name or safe_filename
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"code": "invalid_file_type", "message": "Only .zip uploads are accepted"},
+            )
+        original_name = Path(file.filename).name
+        try:
+            zip_filename = _store_uploaded_zip(file)
+        except IngestionError as exc:
+            _raise_ingestion_error(exc)
+        project_name = project_name or original_name
     else:
-        github_url = github_url.strip()
-        if not github_url.startswith(("https://", "http://")):
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="github_url must be an HTTP(S) URL")
+        try:
+            github_url = require_public_github_repository(github_url)
+        except IngestionError as exc:
+            _raise_ingestion_error(exc)
         project_name = project_name or github_url.rstrip("/").split("/")[-1]
 
     project = Project(name=project_name, github_url=github_url, zip_filename=str(zip_filename) if zip_filename else None)
-    db.add(project)
-    db.commit()
-    db.refresh(project)
+    try:
+        db.add(project)
+        db.commit()
+        db.refresh(project)
+    except Exception:
+        db.rollback()
+        if zip_filename:
+            zip_filename.unlink(missing_ok=True)
+        raise
     return _project_response(project)
 
 
@@ -108,6 +151,7 @@ def delete_project(project: Project = Depends(get_project_or_404), db: Session =
 
     project_dir = PROJECTS_DIR / str(project_id)
     if project_dir.exists():
+        import shutil
         shutil.rmtree(project_dir)
     if zip_path and zip_path.exists():
         try:

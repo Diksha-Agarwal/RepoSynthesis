@@ -1,129 +1,161 @@
 import os
+import subprocess
 import tempfile
-from langchain_community.document_loaders import GitLoader, DirectoryLoader
-# from langchain.docstore.document import Document
-from models import Document
-from langchain_community.document_loaders import UnstructuredFileLoader
-import zipfile
-import nbformat
 from pathlib import Path
+
+import nbformat
+
+from ingestion import (
+    IngestionError,
+    SETTINGS,
+    extract_zip_safely,
+    remove_temporary_directory,
+    require_public_github_repository,
+    resolve_uploaded_zip,
+)
+from models import Document
+
 
 class RepoLoader:
     @staticmethod
-    def load_zip(zip_file_path: str):
-        temp_dir = tempfile.mkdtemp()
-        with zipfile.ZipFile(zip_file_path, "r") as z:
-            z.extractall(temp_dir)
-        return temp_dir
-    
+    def load_zip(zip_file_path: str) -> str:
+        zip_path = resolve_uploaded_zip(zip_file_path)
+        temp_dir = tempfile.mkdtemp(prefix="repo_zip_")
+        try:
+            extract_zip_safely(zip_path, Path(temp_dir))
+            return temp_dir
+        except Exception:
+            remove_temporary_directory(temp_dir)
+            raise
+
     @staticmethod
     def load_github(url: str) -> str:
-        """
-        Clones GitHub repo using LangChain GitLoader
-        Tries 'main' branch first, falls back to 'master' if that fails
-        """
-        temp_dir = tempfile.mkdtemp()
-        
-        # Try main branch first
+        """Validate and shallow-clone a public GitHub repository."""
+        canonical_url = require_public_github_repository(url)
+        temp_dir = tempfile.mkdtemp(prefix="repo_clone_")
+        command = [
+            "git",
+            "-c",
+            "protocol.file.allow=never",
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            "--no-tags",
+            canonical_url,
+            temp_dir,
+        ]
+        environment = os.environ.copy()
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        clone_completed = False
         try:
-            loader = GitLoader(repo_path=temp_dir, clone_url=url, branch="main")
-            loader.load()  # Actually clones the repo
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=SETTINGS.repository_clone_timeout_seconds,
+                check=False,
+                env=environment,
+            )
+            if result.returncode != 0:
+                raise IngestionError("github_clone_failed", "Failed to clone the public GitHub repository")
+            clone_completed = True
             return temp_dir
-        except Exception as e:
-            print(f"Failed to clone 'main' branch: {e}")
-            # Try master branch as fallback
-            try:
-                import shutil
-                shutil.rmtree(temp_dir)  # Clean up failed clone
-                temp_dir = tempfile.mkdtemp()
-                loader = GitLoader(repo_path=temp_dir, clone_url=url, branch="master")
-                loader.load()
-                return temp_dir
-            except Exception as e2:
-                print(f"Failed to clone 'master' branch: {e2}")
-                # Last resort: try without specifying branch
-                try:
-                    import shutil
-                    shutil.rmtree(temp_dir)
-                    temp_dir = tempfile.mkdtemp()
-                    loader = GitLoader(repo_path=temp_dir, clone_url=url)
-                    loader.load()
-                    return temp_dir
-                except Exception as e3:
-                    raise ValueError(f"Failed to clone repository: {e3}")
-    
+        except subprocess.TimeoutExpired as exc:
+            raise IngestionError(
+                "github_clone_timeout",
+                "GitHub repository clone exceeded the configured timeout",
+                504,
+            ) from exc
+        except OSError as exc:
+            raise IngestionError("git_unavailable", "Git is unavailable on the backend server", 500) from exc
+        except Exception:
+            raise
+        finally:
+            if not clone_completed:
+                remove_temporary_directory(temp_dir)
+
     @staticmethod
     def load_repo(input_value: str) -> str:
-        if input_value.endswith(".zip") and os.path.exists(input_value):
+        if str(input_value).lower().endswith(".zip"):
             return RepoLoader.load_zip(input_value)
-        elif input_value.startswith("http"):
+        if str(input_value).startswith("https://"):
             return RepoLoader.load_github(input_value)
-        else:
-            raise ValueError("Invalid input type or file path does not exist")
-        
+        raise IngestionError("invalid_repository_source", "Repository source must be a server upload or public GitHub URL")
+
+    @staticmethod
+    def cleanup(repo_path: str) -> None:
+        remove_temporary_directory(repo_path)
+
     @staticmethod
     def load_documents(repo_path: str) -> list[Document]:
-        SKIP_DIRS = {"node_modules", "__pycache__", ".git", ".venv", "venv", ".tox", "dist", "build"}
-        SKIP_EXTENSIONS = {".pyc", ".pyo", ".exe", ".dll", ".so", ".o", ".a",
-                           ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
-                           ".woff", ".woff2", ".ttf", ".eot",
-                           ".zip", ".tar", ".gz", ".lock"}
+        repo_root = Path(repo_path).resolve()
+        skip_dirs = {"node_modules", "__pycache__", ".git", ".venv", "venv", ".tox", "dist", "build"}
+        skip_extensions = {
+            ".pyc", ".pyo", ".exe", ".dll", ".so", ".o", ".a",
+            ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg",
+            ".woff", ".woff2", ".ttf", ".eot",
+            ".zip", ".tar", ".gz", ".lock",
+        }
 
         def is_valid_file(file_path):
+            candidate = Path(file_path)
+            if candidate.is_symlink():
+                return False
+            try:
+                candidate.resolve().relative_to(repo_root)
+            except ValueError:
+                return False
             parts = file_path.replace("\\", "/").split("/")
             for part in parts:
-                if part.startswith(".") or part in SKIP_DIRS:
+                if part.startswith(".") or part in skip_dirs:
                     return False
             filename = os.path.basename(file_path)
             if filename.startswith(".env"):
                 return False
-            ext = Path(file_path).suffix.lower()
-            if ext in SKIP_EXTENSIONS:
-                return False
-            return os.path.isfile(file_path)
+            extension = Path(file_path).suffix.lower()
+            return extension not in skip_extensions and os.path.isfile(file_path)
 
         def notebook_to_code(file_path: str):
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
-                    nb = nbformat.read(f, as_version=4)
-                code_cells = [cell.source for cell in nb.cells if cell.cell_type == "code"]
-                return "\n\n".join(code_cells)
-            except Exception as e:
-                print(f"Failed to read notebook {file_path}: {e}")
+                with open(file_path, "r", encoding="utf-8") as source:
+                    notebook = nbformat.read(source, as_version=4)
+                return "\n\n".join(cell.source for cell in notebook.cells if cell.cell_type == "code")
+            except Exception as exc:
+                print(f"Failed to read notebook {file_path}: {exc}")
                 return ""
 
         def read_file_safe(file_path: str) -> str:
-            """Read a file with multiple encoding fallbacks."""
             for encoding in ("utf-8", "latin-1"):
                 try:
-                    with open(file_path, "r", encoding=encoding) as f:
-                        return f.read()
+                    with open(file_path, "r", encoding=encoding) as source:
+                        return source.read()
                 except (UnicodeDecodeError, ValueError):
                     continue
             return ""
 
         documents = []
-        for root, dirs, files in os.walk(repo_path):
-            # Skip hidden/unwanted directories in-place for efficiency
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
-            for file in files:
-                file_path = os.path.join(root, file)
-
-                if not is_valid_file(file_path):
-                    continue
-
-                ext = Path(file_path).suffix.lower()
-
-                if ext == ".ipynb":
-                    content = notebook_to_code(file_path)
+        try:
+            for root, dirs, files in os.walk(repo_path):
+                dirs[:] = [
+                    directory
+                    for directory in dirs
+                    if directory not in skip_dirs
+                    and not directory.startswith(".")
+                    and not (Path(root) / directory).is_symlink()
+                ]
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    if not is_valid_file(file_path):
+                        continue
+                    if Path(file_path).suffix.lower() == ".ipynb":
+                        content = notebook_to_code(file_path)
+                    else:
+                        content = read_file_safe(file_path)
                     if content.strip():
                         documents.append(Document(page_content=content, metadata={"source": file_path}))
-                else:
-                    content = read_file_safe(file_path)
-                    if content.strip():
-                        documents.append(Document(page_content=content, metadata={"source": file_path}))
 
-        print(f"Loaded {len(documents)} documents from {repo_path}")
-        return documents
-    
-
+            print(f"Loaded {len(documents)} documents from {repo_path}")
+            return documents
+        finally:
+            RepoLoader.cleanup(repo_path)

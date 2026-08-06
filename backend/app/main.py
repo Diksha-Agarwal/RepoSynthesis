@@ -34,6 +34,7 @@ from api_schemas import (
     PreprocessStatusResponse,
 )
 from db import Project
+from ingestion import IngestionError, SETTINGS, resolve_uploaded_zip
 from projects import get_project_or_404, router as projects_router
 
 
@@ -67,8 +68,25 @@ def _error_response(status_code: int, code: str, message: str, details: Any = No
     return JSONResponse(status_code=status_code, content={"error": error})
 
 
+@app.middleware("http")
+async def reject_oversized_upload_requests(request: Request, call_next):
+    if request.method == "POST" and request.url.path.rstrip("/") == "/projects/upload":
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                request_size = int(content_length)
+            except ValueError:
+                return _error_response(400, "invalid_content_length", "Content-Length must be a valid integer")
+            multipart_allowance = 1024 * 1024
+            if request_size > SETTINGS.max_upload_zip_bytes + multipart_allowance:
+                return _error_response(413, "upload_too_large", "Upload request exceeds the configured size limit")
+    return await call_next(request)
+
+
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(_: Request, exc: StarletteHTTPException):
+    if isinstance(exc.detail, dict) and "code" in exc.detail and "message" in exc.detail:
+        return _error_response(exc.status_code, exc.detail["code"], exc.detail["message"], exc.detail.get("details"))
     message = exc.detail if isinstance(exc.detail, str) else "Request failed"
     details = None if isinstance(exc.detail, str) else exc.detail
     return _error_response(exc.status_code, f"http_{exc.status_code}", message, details)
@@ -110,7 +128,10 @@ def run_preprocessing(project_id: str, file_path: str):
             message = "Invalid file path or GitHub URL."
         else:
             message = str(exc)
-        preprocess_status[project_id] = {"status": "failed", "error": message}
+        failure = {"status": "failed", "error": message}
+        if isinstance(exc, IngestionError):
+            failure["error_code"] = exc.code
+        preprocess_status[project_id] = failure
 
 
 @app.post("/projects/{project_id}/preprocess", response_model=ActionResponse)
@@ -118,8 +139,11 @@ async def preprocess_project(project: Project = Depends(get_project_or_404)):
     file_path = project.zip_filename or project.github_url
     if not file_path:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Project has no ZIP file or GitHub URL")
-    if not str(file_path).startswith("http") and not Path(file_path).exists():
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded ZIP file is missing; upload the project again")
+    if project.zip_filename:
+        try:
+            file_path = str(resolve_uploaded_zip(project.zip_filename))
+        except IngestionError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
 
     project_id = str(project.id)
     Thread(target=run_preprocessing, args=(project_id, str(file_path)), daemon=True).start()

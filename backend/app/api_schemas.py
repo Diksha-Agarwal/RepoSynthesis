@@ -1,6 +1,6 @@
 from typing import Any, List, Literal, Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class ErrorBody(BaseModel):
@@ -17,7 +17,7 @@ class ProjectCreateRequest(BaseModel):
     """JSON request for a GitHub-backed project."""
 
     name: Optional[str] = Field(default=None, min_length=1, max_length=200)
-    github_url: HttpUrl
+    github_url: str = Field(min_length=1, max_length=2048)
 
 
 class ProjectResponse(BaseModel):
@@ -44,6 +44,7 @@ class PreprocessStatusResponse(BaseModel):
     status: Literal["not_started", "running", "completed", "failed"]
     current_step: Optional[str] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
 
 
 class AnalysisRequest(BaseModel):

@@ -9,6 +9,7 @@ try:
 except ImportError:
     CodeSearchFAISS = None
 from team_adapter import save_for_graphflow
+from ingestion import validate_project_id
 from dotenv import load_dotenv
 
 # Load API key from .env (better than hardcoding)
@@ -90,12 +91,14 @@ def process_repository_for_graphflow(file_path: str, project_id: str = None, sta
     # Generate project_id if not provided
     if not project_id:
         project_id = str(uuid.uuid4())
+    project_id = validate_project_id(project_id)
     
     print(f"\n{'='*80}")
     print(f"🔬 Processing repository for GraphFlow: {file_path}")
     print(f"📋 Project ID: {project_id}")
     print(f"{'='*80}\n")
     
+    repo_path = None
     try:
         # 1️⃣ Load repo and documents
         if status_callback: status_callback("Loading repository files...")
@@ -164,6 +167,8 @@ def process_repository_for_graphflow(file_path: str, project_id: str = None, sta
     except Exception as e:
         print(f"\n❌ Processing Failed: {str(e)}")
         raise
+    finally:
+        RepoLoader.cleanup(repo_path)
 
 
 if __name__ == "__main__":

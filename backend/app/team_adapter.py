@@ -4,6 +4,7 @@ Adapter to convert preprocessor output to GraphFlow format
 import json
 from pathlib import Path
 from typing import Dict, Any
+from ingestion import validate_project_id
 
 # Absolute base path for project data
 _BASE_DATA_DIR = Path(__file__).parent / "data" / "projects"
@@ -84,6 +85,7 @@ def save_for_graphflow(
     # Validate inputs
     if not project_id or not isinstance(project_id, str):
         raise ValueError("project_id must be a non-empty string")
+    project_id = validate_project_id(project_id)
     
     if not repo_analysis or not isinstance(repo_analysis, dict):
         raise ValueError("repo_analysis must be a dictionary")
@@ -92,7 +94,12 @@ def save_for_graphflow(
         raise ValueError("sections_count must be positive")
     
     # Create project directory
-    project_dir = Path(output_dir) / project_id
+    output_path = Path(output_dir).resolve()
+    project_dir = (output_path / project_id).resolve()
+    try:
+        project_dir.relative_to(output_path)
+    except ValueError as exc:
+        raise ValueError("project_id resolves outside the project data directory") from exc
     project_dir.mkdir(parents=True, exist_ok=True)
     
     # 1. Save context.json
