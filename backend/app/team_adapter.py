@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 from ingestion import validate_project_id
+from settings import SETTINGS
 
 # Absolute base path for project data
-_BASE_DATA_DIR = Path(__file__).parent / "data" / "projects"
+_BASE_DATA_DIR = SETTINGS.data_dir / "projects"
 
 
 def create_graphflow_context(

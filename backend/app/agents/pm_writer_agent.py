@@ -103,7 +103,8 @@ CRITICAL: ALL fields shown above are REQUIRED. Output ONLY valid JSON."""
         model=config.llm_model,
         api_key=api_key,
         temperature=config.temperature,
-        max_tokens=config.max_tokens
+        max_tokens=config.max_tokens,
+        timeout=config.request_timeout,
     )
 
     return AssistantAgent(
@@ -112,4 +113,3 @@ CRITICAL: ALL fields shown above are REQUIRED. Output ONLY valid JSON."""
         model_client=model_client,
         system_message=system_message
     )
-

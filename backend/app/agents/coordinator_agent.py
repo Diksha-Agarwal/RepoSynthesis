@@ -55,7 +55,8 @@ Keep output concise and actionable."""
         model=config.llm_model,
         api_key=api_key,
         temperature=0.2,
-        max_tokens=config.max_tokens
+        max_tokens=config.max_tokens,
+        timeout=config.request_timeout,
     )
 
     return AssistantAgent(
@@ -64,5 +65,4 @@ Keep output concise and actionable."""
         model_client=model_client,
         system_message=system_message
     )
-
 

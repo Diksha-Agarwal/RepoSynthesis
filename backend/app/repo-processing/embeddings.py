@@ -2,6 +2,7 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 import os
 from dotenv import load_dotenv
+from settings import SETTINGS
 
 load_dotenv()
 openai_api_key = os.getenv("OPENAI_API_KEY")
@@ -9,7 +10,11 @@ openai_api_key = os.getenv("OPENAI_API_KEY")
 class EmbeddingStoreFAISS:
     def __init__(self):
         # Initialize OpenAI embeddings
-        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=openai_api_key)
+        self.embeddings = OpenAIEmbeddings(
+            model=SETTINGS.openai_embedding_model,
+            api_key=openai_api_key,
+            request_timeout=SETTINGS.openai_request_timeout_seconds,
+        )
         self.store = None
 
     def add_sections(self, sections):

@@ -1,6 +1,4 @@
 from datetime import datetime, timezone
-from pathlib import Path
-
 from sqlalchemy import (
     JSON,
     CheckConstraint,
@@ -18,21 +16,28 @@ from sqlalchemy import (
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, sessionmaker
 
+from settings import SETTINGS
 
-_APP_DIR = Path(__file__).parent
-DATA_DIR = _APP_DIR / "data"
+
+DATA_DIR = SETTINGS.data_dir
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-_DB_PATH = str((DATA_DIR / "app.db").resolve()).replace("\\", "/")
-DATABASE_URL = f"sqlite:///{_DB_PATH}"
-
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+DATABASE_URL = SETTINGS.database_url
+_IS_SQLITE = DATABASE_URL.startswith("sqlite:")
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 30} if _IS_SQLITE else {},
+    pool_pre_ping=True,
+)
 
 
 @event.listens_for(engine, "connect")
 def enable_sqlite_foreign_keys(dbapi_connection, _):
+    if not _IS_SQLITE:
+        return
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
     cursor.close()
 
 
@@ -133,3 +138,12 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def check_database() -> None:
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+
+
+def close_database() -> None:
+    engine.dispose()

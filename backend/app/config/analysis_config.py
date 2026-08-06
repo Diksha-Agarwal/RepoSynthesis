@@ -59,6 +59,10 @@ class AnalysisConfig(BaseModel):
         default=4000,
         description="Max tokens per agent response"
     )
+    request_timeout: float = Field(
+        default=120,
+        description="OpenAI request timeout in seconds"
+    )
     temperature: float = Field(
         default=0.3,
         description="LLM temperature (0.0-1.0)"

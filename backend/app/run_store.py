@@ -95,6 +95,7 @@ def update_run(
     log_message: Optional[str] = None,
     insight_activity: Optional[str] = None,
     insight: Any = None,
+    clear_error: bool = False,
 ) -> Optional[Dict[str, Any]]:
     with SessionLocal() as db:
         run = db.get(AnalysisRun, run_id)
@@ -116,6 +117,8 @@ def update_run(
             run.current_activity = current_activity
         if error_message is not None:
             run.error_message = error_message
+        elif clear_error:
+            run.error_message = None
         if log_message:
             run.logs = list(run.logs or []) + [log_message]
         if insight_activity and insight is not None:
@@ -146,6 +149,12 @@ def list_project_runs(project_id: int) -> List[Dict[str, Any]]:
             .order_by(AnalysisRun.created_at.desc())
             .all()
         )
+        return [run_to_dict(run) for run in runs]
+
+
+def list_active_runs() -> List[Dict[str, Any]]:
+    with SessionLocal() as db:
+        runs = db.query(AnalysisRun).filter(AnalysisRun.status.in_(ACTIVE_STATUSES)).all()
         return [run_to_dict(run) for run in runs]
 
 
@@ -255,21 +264,3 @@ def list_completed_analysis_results(project_id: int) -> List[Dict[str, Any]]:
             .all()
         )
         return [dict(record.payload) for record in records]
-
-
-def cancel_orphaned_active_runs() -> int:
-    """Cancel work that cannot survive an application-process restart."""
-    with SessionLocal() as db:
-        active_runs = db.query(AnalysisRun).filter(AnalysisRun.status.in_(ACTIVE_STATUSES)).all()
-        if not active_runs:
-            return 0
-        now = utc_now()
-        for run in active_runs:
-            run.status = "cancelled"
-            run.current_activity = "Cancelled after backend restart"
-            run.error_message = "The backend restarted before this in-process run finished"
-            run.completed_at = now
-            run.updated_at = now
-            run.logs = list(run.logs or []) + ["Run cancelled during backend startup reconciliation"]
-        db.commit()
-        return len(active_runs)

@@ -5,6 +5,7 @@ from models import RepoIntelModel
 import json
 import os
 from dotenv import load_dotenv
+from settings import SETTINGS
 
 
 load_dotenv()
@@ -17,8 +18,9 @@ class RepoIntel:
     def get_llm(cls):
         if cls._llm is None:
             cls._llm = ChatOpenAI(
-                model="gpt-4o-mini", 
-                temperature=0.4
+                model=SETTINGS.openai_model,
+                temperature=0.4,
+                timeout=SETTINGS.openai_request_timeout_seconds,
             )
         return cls._llm
     

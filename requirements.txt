@@ -9,6 +9,8 @@ langchain-community
 langchain-openai
 faiss-cpu
 python-dotenv
+redis>=5.0,<7
+rq>=2.8,<3
 unstructured
 nbformat
 autogen-agentchat==0.7.5

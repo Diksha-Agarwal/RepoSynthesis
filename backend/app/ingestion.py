@@ -6,43 +6,12 @@ import shutil
 import stat
 import tempfile
 import zipfile
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Optional
 from urllib.parse import urlsplit
 
 import requests
-from dotenv import load_dotenv
-
-
-APP_DIR = Path(__file__).parent.resolve()
-load_dotenv(APP_DIR.parent.parent / ".env")
-
-
-def _positive_int(name: str, default: int) -> int:
-    raw_value = os.getenv(name, str(default))
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise RuntimeError(f"{name} must be an integer") from exc
-    if value <= 0:
-        raise RuntimeError(f"{name} must be greater than zero")
-    return value
-
-
-@dataclass(frozen=True)
-class IngestionSettings:
-    max_upload_zip_bytes: int = _positive_int("MAX_UPLOAD_ZIP_BYTES", 100 * 1024 * 1024)
-    max_extracted_total_bytes: int = _positive_int("MAX_EXTRACTED_TOTAL_BYTES", 500 * 1024 * 1024)
-    max_extracted_files: int = _positive_int("MAX_EXTRACTED_FILES", 10_000)
-    max_extracted_file_bytes: int = _positive_int("MAX_EXTRACTED_FILE_BYTES", 50 * 1024 * 1024)
-    max_zip_compression_ratio: int = _positive_int("MAX_ZIP_COMPRESSION_RATIO", 200)
-    repository_clone_timeout_seconds: int = _positive_int("REPOSITORY_CLONE_TIMEOUT_SECONDS", 120)
-    github_validation_timeout_seconds: int = _positive_int("GITHUB_VALIDATION_TIMEOUT_SECONDS", 10)
-    uploads_dir: Path = APP_DIR / "data" / "uploads"
-
-
-SETTINGS = IngestionSettings()
+from settings import SETTINGS
 
 
 class IngestionError(ValueError):
@@ -131,7 +100,7 @@ def require_public_github_repository(url: str) -> str:
 
 
 def resolve_uploaded_zip(path: str) -> Path:
-    upload_root = SETTINGS.uploads_dir.resolve()
+    upload_root = (SETTINGS.data_dir / "uploads").resolve()
     supplied_path = Path(path)
     if supplied_path.is_symlink():
         raise IngestionError("unsafe_upload_path", "Uploaded ZIP path must not be a symbolic link")

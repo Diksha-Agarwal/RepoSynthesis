@@ -38,6 +38,15 @@ class ActionResponse(BaseModel):
     status: str
 
 
+class HealthResponse(BaseModel):
+    status: Literal["ok"]
+
+
+class ReadinessResponse(BaseModel):
+    status: Literal["ready"]
+    checks: Dict[str, Literal["ok"]]
+
+
 class DeleteResponse(ActionResponse):
     project_id: int
 

@@ -16,7 +16,7 @@ from ingestion import (
 
 
 router = APIRouter(prefix="/projects", tags=["projects"])
-UPLOADS_DIR = SETTINGS.uploads_dir
+UPLOADS_DIR = SETTINGS.data_dir / "uploads"
 PROJECTS_DIR = DATA_DIR / "projects"
 
 

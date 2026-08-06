@@ -1,24 +1,19 @@
-import asyncio
 import sys
 import time
-import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
-from threading import Thread
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from langchain_core.messages import AIMessage, HumanMessage
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 ROOT = Path(__file__).parent
-load_dotenv(ROOT.parent.parent / ".env")
-
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "repo-processing"))
 sys.path.insert(0, str(ROOT.parent))
@@ -28,22 +23,32 @@ from api_schemas import (
     AnalysisRequest,
     ChatRequest,
     ChatResponse,
+    ErrorResponse,
+    HealthResponse,
     LatestRunsResponse,
     LatestRunStatusResponse,
     RunListResponse,
     RunResponse,
     RunStartResponse,
+    ReadinessResponse,
 )
 from app.models.schemas import AnalysisResult, AnalysisResultListResponse
-from db import Project
-from ingestion import IngestionError, SETTINGS, resolve_uploaded_zip
+from background_jobs import run_analysis_job, run_preprocessing_job
+from db import Project, check_database, close_database
+from ingestion import IngestionError, resolve_uploaded_zip
+from job_queue import (
+    JobQueueUnavailableError,
+    check_redis,
+    close_redis_connection,
+    enqueue_run,
+    reconcile_active_jobs,
+)
+from logging_config import configure_logging, get_logger
 from projects import get_project_or_404, router as projects_router
 from run_store import (
     ActiveRunExistsError,
     ProjectNotFoundError,
-    cancel_orphaned_active_runs,
     create_run,
-    finalize_analysis_run,
     get_analysis_result,
     get_latest_completed_analysis_result,
     get_latest_run,
@@ -52,32 +57,53 @@ from run_store import (
     list_project_runs,
     update_run,
 )
+from settings import SETTINGS
+
+
+configure_logging()
+logger = get_logger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    if SETTINGS.validation_errors:
+        logger.error("configuration_invalid", extra={"errors": list(SETTINGS.validation_errors)})
+    else:
+        try:
+            check_database()
+            check_redis()
+            reconciled = reconcile_active_jobs()
+            logger.info("backend_started", extra={"reconciled_runs": reconciled})
+        except Exception:
+            logger.exception("startup_dependency_check_failed")
+    try:
+        yield
+    finally:
+        close_redis_connection()
+        close_database()
+        logger.info("backend_stopped")
 
 
 app = FastAPI(
     title="RepoResearchAI Demo API",
     description="Single-user repository analysis API for the Next.js demo client.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=list(SETTINGS.cors_allowed_origins),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 app.include_router(projects_router)
 
-BASE_DATA_DIR = ROOT / "data" / "projects"
+BASE_DATA_DIR = SETTINGS.data_dir / "projects"
 BASE_DATA_DIR.mkdir(parents=True, exist_ok=True)
 project_chat_histories: dict[str, list] = {}
-vector_store_cache: dict[str, Any] = {}
+vector_store_cache: dict[str, tuple[int, Any]] = {}
 llm_instance = None
-
-
-@app.on_event("startup")
-def reconcile_interrupted_runs():
-    cancel_orphaned_active_runs()
 
 
 def _error_response(status_code: int, code: str, message: str, details: Any = None) -> JSONResponse:
@@ -87,19 +113,47 @@ def _error_response(status_code: int, code: str, message: str, details: Any = No
     return JSONResponse(status_code=status_code, content={"error": error})
 
 
+def _finish_request(request: Request, response: Response, request_id: str, started_at: float) -> Response:
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "api_request",
+        extra={
+            "request_id": request_id,
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": response.status_code,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000, 2),
+        },
+    )
+    return response
+
+
 @app.middleware("http")
-async def reject_oversized_upload_requests(request: Request, call_next):
+async def request_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or str(uuid4())
+    started_at = time.perf_counter()
+    if SETTINGS.validation_errors and request.url.path not in {"/health", "/ready", "/docs", "/openapi.json"}:
+        response = _error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "configuration_invalid",
+            "Backend configuration is invalid",
+            {"errors": list(SETTINGS.validation_errors)},
+        )
+        return _finish_request(request, response, request_id, started_at)
     if request.method == "POST" and request.url.path.rstrip("/") == "/projects/upload":
         content_length = request.headers.get("content-length")
         if content_length:
             try:
                 request_size = int(content_length)
             except ValueError:
-                return _error_response(400, "invalid_content_length", "Content-Length must be a valid integer")
+                response = _error_response(400, "invalid_content_length", "Content-Length must be a valid integer")
+                return _finish_request(request, response, request_id, started_at)
             multipart_allowance = 1024 * 1024
             if request_size > SETTINGS.max_upload_zip_bytes + multipart_allowance:
-                return _error_response(413, "upload_too_large", "Upload request exceeds the configured size limit")
-    return await call_next(request)
+                response = _error_response(413, "upload_too_large", "Upload request exceeds the configured size limit")
+                return _finish_request(request, response, request_id, started_at)
+    response = await call_next(request)
+    return _finish_request(request, response, request_id, started_at)
 
 
 @app.exception_handler(StarletteHTTPException)
@@ -123,63 +177,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_: Request, exc: Exception):
-    traceback.print_exception(exc)
+    logger.exception("unhandled_api_error", exc_info=exc)
     return _error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, "internal_error", "An unexpected server error occurred")
-
-
-def run_preprocessing(project_id: str, run_id: str, file_path: str):
-    from pipeline import process_repository_for_graphflow
-
-    progress_by_activity = {
-        "Loading repository files...": 10,
-        "Extracting code sections...": 30,
-        "Analyzing repository structure...": 50,
-        "Generating embeddings...": 70,
-        "Saving project data...": 90,
-    }
-    try:
-        update_run(
-            run_id,
-            status="running",
-            progress=1,
-            current_activity="Starting preprocessing...",
-            log_message="Preprocessing started",
-        )
-
-        def update_step(message: str):
-            progress = progress_by_activity.get(message, 5)
-            update_run(
-                run_id,
-                progress=progress,
-                current_activity=message,
-                log_message=f"[{progress}%] {message}",
-            )
-
-        update_step("Cloning GitHub repository..." if file_path.startswith("http") else "Extracting ZIP file...")
-        process_repository_for_graphflow(file_path, project_id=project_id, status_callback=update_step)
-        update_run(
-            run_id,
-            status="completed",
-            progress=100,
-            current_activity="Preprocessing complete",
-            log_message="[100%] Preprocessing complete",
-        )
-        vector_store_cache.pop(project_id, None)
-    except Exception as exc:
-        traceback.print_exc()
-        if "Failed to clone repository" in str(exc):
-            message = "Failed to clone GitHub repository. Check the URL and ensure the repository is public."
-        elif "Invalid input type" in str(exc):
-            message = "Invalid file path or GitHub URL."
-        else:
-            message = str(exc)
-        update_run(
-            run_id,
-            status="failed",
-            current_activity="Preprocessing failed",
-            error_message=message,
-            log_message=f"Preprocessing failed: {message}",
-        )
 
 
 @app.post("/projects/{project_id}/preprocess", response_model=RunStartResponse)
@@ -205,19 +204,26 @@ async def preprocess_project(project: Project = Depends(get_project_or_404)):
         ) from exc
 
     try:
-        Thread(
-            target=run_preprocessing,
-            args=(str(project.id), run["run_id"], str(file_path)),
-            daemon=True,
-        ).start()
-    except Exception as exc:
+        enqueue_run(
+            run["run_id"],
+            "preprocessing",
+            run_preprocessing_job,
+            str(project.id),
+            run["run_id"],
+            str(file_path),
+        )
+    except JobQueueUnavailableError as exc:
         update_run(
             run["run_id"],
             status="failed",
-            current_activity="Unable to start preprocessing",
+            current_activity="Unable to enqueue preprocessing",
             error_message=str(exc),
+            log_message=f"Unable to enqueue preprocessing: {exc}",
         )
-        raise
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "job_queue_unavailable", "message": str(exc)},
+        ) from exc
     return RunStartResponse(**run)
 
 
@@ -233,79 +239,6 @@ async def get_preprocess_status(project: Project = Depends(get_project_or_404)):
             current_step="Not started",
         )
     return LatestRunStatusResponse(**run, current_step=run["current_activity"], error=run["error_message"])
-
-
-async def run_graphflow_analysis(
-    project_id: str,
-    run_id: str,
-    personas: str = "SDE,PM",
-    depth: str = "standard",
-    verbosity: str = "medium",
-):
-    def update(activity: str, progress: int, insight: str = None):
-        update_run(
-            run_id,
-            progress=progress,
-            current_activity=activity,
-            log_message=f"[{progress}%] {activity}",
-            insight_activity=activity if insight else None,
-            insight=insight,
-        )
-
-    try:
-        update_run(
-            run_id,
-            status="running",
-            progress=1,
-            current_activity="Starting analysis...",
-            log_message="Analysis started",
-        )
-        from app.config.analysis_config import AnalysisConfig, FeaturesEnabled
-        from app.teams.graphflow_team import GraphFlowCoordinator
-
-        personas_list = [persona.strip() for persona in personas.split(",")]
-        config = AnalysisConfig(
-            depth=depth,
-            verbosity=verbosity,
-            features_enabled=FeaturesEnabled(
-                structure=True,
-                api_db=True,
-                best_practices=True,
-                pm_insights="PM" in personas_list,
-            ),
-        )
-        update("Creating analysis coordinator...", 5)
-        coordinator = GraphFlowCoordinator(
-            project_id,
-            config,
-            project_dir=BASE_DATA_DIR / project_id,
-            analysis_run_id=run_id,
-        )
-        coordinator.selected_personas = personas_list
-        coordinator.status_callback = update
-
-        update("Running agent pipeline...", 10)
-        result = await coordinator.run_analysis()
-        error_message = "; ".join(result.errors) if result.errors else None
-        finalize_analysis_run(
-            int(project_id),
-            run_id,
-            result.model_dump(mode="json"),
-            success=result.success,
-            error_message=error_message,
-        )
-        if not result.success:
-            return
-    except Exception as exc:
-        traceback.print_exc()
-        error_message = f"{type(exc).__name__}: {exc}"
-        update_run(
-            run_id,
-            status="failed",
-            current_activity="Analysis failed",
-            error_message=error_message,
-            log_message=f"Analysis failed: {error_message}",
-        )
 
 
 @app.post("/projects/{project_id}/analyze/graphflow", response_model=RunStartResponse)
@@ -332,15 +265,28 @@ async def start_analysis(payload: AnalysisRequest, project: Project = Depends(ge
 
     personas = ",".join(payload.personas)
     try:
-        asyncio.create_task(run_graphflow_analysis(project_id, run["run_id"], personas, payload.depth, payload.verbosity))
-    except Exception as exc:
+        enqueue_run(
+            run["run_id"],
+            "analysis",
+            run_analysis_job,
+            project_id,
+            run["run_id"],
+            personas,
+            payload.depth,
+            payload.verbosity,
+        )
+    except JobQueueUnavailableError as exc:
         update_run(
             run["run_id"],
             status="failed",
-            current_activity="Unable to start analysis",
+            current_activity="Unable to enqueue analysis",
             error_message=str(exc),
+            log_message=f"Unable to enqueue analysis: {exc}",
         )
-        raise
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": "job_queue_unavailable", "message": str(exc)},
+        ) from exc
     return RunStartResponse(**run)
 
 
@@ -446,12 +392,23 @@ async def ask(payload: ChatRequest, project: Project = Depends(get_project_or_40
 
     try:
         project_chat_histories.setdefault(project_id, [])
-        if project_id not in vector_store_cache:
-            vector_store_cache[project_id] = load_vector_store(str(project_dir / "vector_store"))
-        vectorstore = vector_store_cache[project_id]
+        vector_store_dir = project_dir / "vector_store"
+        vector_store_version = max(
+            (path.stat().st_mtime_ns for path in vector_store_dir.iterdir() if path.is_file()),
+            default=0,
+        )
+        cached_store = vector_store_cache.get(project_id)
+        if cached_store is None or cached_store[0] != vector_store_version:
+            cached_store = (vector_store_version, load_vector_store(str(vector_store_dir)))
+            vector_store_cache[project_id] = cached_store
+        vectorstore = cached_store[1]
         if llm_instance is None:
             from langchain_openai import ChatOpenAI
-            llm_instance = ChatOpenAI(model="gpt-4o-mini", temperature=0.3)
+            llm_instance = ChatOpenAI(
+                model=SETTINGS.openai_chat_model,
+                temperature=SETTINGS.openai_temperature,
+                timeout=SETTINGS.openai_request_timeout_seconds,
+            )
 
         docs = vectorstore.as_retriever(search_kwargs={"k": 3}).invoke(payload.question)
         context = "\n\n".join(
@@ -504,7 +461,7 @@ async def ask(payload: ChatRequest, project: Project = Depends(get_project_or_40
     except HTTPException:
         raise
     except Exception as exc:
-        traceback.print_exc()
+        logger.exception("chat_failed", extra={"project_id": project_id})
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Unable to answer the question") from exc
 
 
@@ -522,6 +479,37 @@ async def clear_cache(project: Project = Depends(get_project_or_404)):
     return ActionResponse(status="cache_cleared" if had_cache else "no_cache")
 
 
-@app.get("/health", response_model=ActionResponse)
+@app.get("/health", response_model=HealthResponse)
 async def health():
-    return ActionResponse(status="ok")
+    return HealthResponse(status="ok")
+
+
+@app.get("/ready", response_model=ReadinessResponse, responses={503: {"model": ErrorResponse}})
+async def ready():
+    checks: dict[str, str] = {}
+    errors: list[str] = list(SETTINGS.validation_errors)
+    checks["configuration"] = "ok" if not SETTINGS.validation_errors else "failed"
+    try:
+        check_database()
+        checks["database"] = "ok"
+    except Exception as exc:
+        checks["database"] = "failed"
+        errors.append(f"Database check failed: {type(exc).__name__}")
+        logger.exception("readiness_database_failed")
+    try:
+        check_redis()
+        checks["redis"] = "ok"
+        if not SETTINGS.validation_errors and checks.get("database") == "ok":
+            reconcile_active_jobs()
+    except Exception as exc:
+        checks["redis"] = "failed"
+        errors.append(f"Redis check failed: {type(exc).__name__}")
+        logger.exception("readiness_redis_failed")
+    if errors:
+        return _error_response(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "backend_not_ready",
+            "Backend dependencies are not ready",
+            {"checks": checks, "errors": errors},
+        )
+    return ReadinessResponse(status="ready", checks={"configuration": "ok", "database": "ok", "redis": "ok"})
